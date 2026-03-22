@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { supabase } from "@/lib/supabase";
 import { songs, Song } from "@/data/songs";
 
@@ -15,81 +15,107 @@ export default function MultiplayerGame({ roomName, playerName, onBack }: { room
   const [options, setOptions] = useState<Song[]>([]);
   const [isHost, setIsHost] = useState(false);
   const [selectedOption, setSelectedOption] = useState<string | null>(null);
-  const [statusText, setStatusText] = useState("Waiting for host...");
+  const [statusText, setStatusText] = useState("Connecting to room...");
   const [channel, setChannel] = useState<any>(null);
 
+  // Keep latest state in refs to avoid stale closures in broadcast events
+  const playersRef = useRef(players);
+  useEffect(() => { playersRef.current = players; }, [players]);
+
+  const isHostRef = useRef(isHost);
+  useEffect(() => { isHostRef.current = isHost; }, [isHost]);
+
   useEffect(() => {
+    let mounted = true;
     const roomChannel = supabase.channel(`room_${roomName}`, {
       config: { presence: { key: playerName } },
     });
 
     roomChannel
       .on('presence', { event: 'sync' }, () => {
+        if (!mounted) return;
         const state = roomChannel.presenceState();
-        const newPlayers: Record<string, Player> = {};
-        let hostAssigned = false;
-
-        Object.keys(state).forEach((key, index) => {
-          if (index === 0 && key === playerName) {
-            setIsHost(true);
-            hostAssigned = true;
+        const allPresences = Object.values(state).flat() as any[];
+        
+        // Sort by joined_at to securely identify the true, first host.
+        allPresences.sort((a, b) => a.joined_at - b.joined_at);
+        
+        if (allPresences.length > 0) {
+          const hostPlayer = allPresences[0];
+          const meIsHost = hostPlayer.name === playerName;
+          setIsHost(meIsHost);
+          
+          if (meIsHost && !currentSong) {
+            setStatusText("You are the Host. Click Start when ready!");
+          } else if (!currentSong) {
+            setStatusText(`Waiting for host (${hostPlayer.name})...`);
           }
-          // Preserve score if exists, else 0
-          newPlayers[key] = { name: key, score: players[key]?.score || 0 };
-        });
 
-        setPlayers((prev) => {
-          const merged = { ...prev };
-          Object.keys(newPlayers).forEach(k => {
-            if (!merged[k]) merged[k] = newPlayers[k];
+          // Update player roster but keep scores
+          setPlayers((prev) => {
+            const next: Record<string, Player> = {};
+            allPresences.forEach(p => {
+              if (!next[p.name]) {
+                next[p.name] = { name: p.name, score: prev[p.name]?.score || 0 };
+              }
+            });
+            return next;
           });
-          return merged;
-        });
-
-        if (hostAssigned && !currentSong) {
-          setStatusText("You are the Host. Click Start when ready!");
         }
       })
       .on('broadcast', { event: 'game_state' }, (payload) => {
-        if (payload.payload.type === 'NEW_SONG') {
-          const song = songs.find(s => s.id === payload.payload.songId)!;
+        if (!mounted) return;
+        const data = payload.payload;
+        if (data.type === 'NEW_SONG') {
+          const song = songs.find(s => s.id === data.songId)!;
           setCurrentSong(song);
-          setOptions(payload.payload.options);
+          setOptions(data.options);
           setSelectedOption(null);
           setStatusText("Guess the song!");
-        } else if (payload.payload.type === 'CORRECT_GUESS') {
-          const winner = payload.payload.playerName;
+        } else if (data.type === 'CORRECT_GUESS') {
+          const winner = data.playerName;
+          
           setPlayers((prev) => ({
             ...prev,
-            [winner]: { ...prev[winner], score: prev[winner].score + 1 }
+            [winner]: { ...prev[winner], score: (prev[winner]?.score || 0) + 1 }
           }));
+          
           setStatusText(`${winner} guessed correctly!`);
-          if (isHost) {
-            setTimeout(hostPickNextSong, 2500);
+          
+          if (isHostRef.current) {
+            setTimeout(() => {
+              if (mounted) hostPickNextSong(roomChannel);
+            }, 2500);
           }
         }
       })
       .subscribe(async (status) => {
+        if (!mounted) return;
         if (status === 'SUBSCRIBED') {
-          await roomChannel.track({ name: playerName });
+          // Track with join time so the earliest joiner naturally becomes Host.
+          await roomChannel.track({ name: playerName, joined_at: Date.now() });
+        } else {
+          setStatusText(`Connection status: ${status}`);
         }
       });
 
     setChannel(roomChannel);
 
     return () => {
+      mounted = false;
       roomChannel.unsubscribe();
     };
   }, [roomName, playerName]);
 
-  const hostPickNextSong = () => {
-    if (!channel) return;
+  // Use passed channel to avoid stale refs if channel state hasn't updated
+  const hostPickNextSong = (activeChannel = channel) => {
+    if (!activeChannel) return;
     const shuffled = [...songs].sort(() => Math.random() - 0.5);
     const nextSong = shuffled[0];
     const otherSongs = shuffled.slice(1, 4);
     const allOptions = [nextSong, ...otherSongs].sort(() => Math.random() - 0.5);
     
-    channel.send({
+    activeChannel.send({
       type: 'broadcast',
       event: 'game_state',
       payload: { type: 'NEW_SONG', songId: nextSong.id, options: allOptions }
@@ -100,7 +126,7 @@ export default function MultiplayerGame({ roomName, playerName, onBack }: { room
     if (selectedOption || !currentSong) return;
     setSelectedOption(songId);
 
-    if (songId === currentSong.id) {
+    if (songId === currentSong.id && channel) {
       channel.send({
         type: 'broadcast',
         event: 'game_state',
@@ -116,16 +142,21 @@ export default function MultiplayerGame({ roomName, playerName, onBack }: { room
         <p className="subtitle">{statusText}</p>
       </div>
 
-      <div style={{ display: 'flex', justifyContent: 'space-around', marginBottom: '2rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'center', gap: '2rem', marginBottom: '2rem', flexWrap: 'wrap' }}>
         {Object.values(players).map(p => (
-          <div key={p.name} style={{ fontWeight: p.name === playerName ? 'bold' : 'normal' }}>
-            {p.name}: {p.score}
+          <div key={p.name} className="glass-panel" style={{ padding: '1rem 2rem', width: 'auto', minWidth: '120px' }}>
+            <div style={{ fontWeight: p.name === playerName ? '800' : '500', fontSize: '1.2rem', color: p.name === playerName ? 'var(--accent-color)' : 'white' }}>
+              {p.name} {p.name === playerName ? "(You)" : ""}
+            </div>
+            <div className="score" style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>
+              {p.score}
+            </div>
           </div>
         ))}
       </div>
 
       {isHost && !currentSong && (
-        <button className="btn-primary mb-4" onClick={hostPickNextSong}>
+        <button className="btn-primary mb-4" onClick={() => hostPickNextSong(channel)}>
           Start Game
         </button>
       )}
