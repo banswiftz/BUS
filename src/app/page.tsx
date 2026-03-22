@@ -121,6 +121,9 @@ export default function Home() {
 
         {currentSong && (
           <div className="lyric-box animate-pop" key={currentSong.id}>
+            {currentSong.previewUrl && (
+              <audio src={currentSong.previewUrl} autoPlay style={{ display: 'none' }} />
+            )}
             <p className="lyric-text">"{currentSong.lyric}"</p>
           </div>
         )}
